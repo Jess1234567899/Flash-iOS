@@ -17,6 +17,7 @@ import re
 import os
 from pathlib import Path
 from collections import defaultdict, OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 
 import subprocess
 import psutil
@@ -182,6 +183,79 @@ def read_expert_slices_direct(filepath, tensor_name, expert_indices, header_cach
         return mx.array(np_f32).astype(mx.bfloat16)
     else:
         return mx.array(stacked)
+
+
+def _read_single_expert_attrs(expert_idx, layer_idx, expert_file_map, header_cache):
+    """Read all 9 tensor attributes for a single expert using thread-local file handles.
+
+    Each thread opens its own file handles (no shared seek positions), reads all
+    3 projections x 3 attributes, and returns a dict of results.
+
+    Args:
+        expert_idx: which expert to read (e.g. 42)
+        layer_idx: which layer (for constructing tensor names)
+        expert_file_map: dict of full tensor name -> filepath
+        header_cache: dict for cached headers (read-only after init, thread-safe)
+
+    Returns:
+        dict of (proj_name, attr_name) -> mx.array of shape [1, ...expert_dims]
+    """
+    NP_DTYPE = {
+        'U32': (np.uint32, 4),
+        'F32': (np.float32, 4),
+        'F16': (np.float16, 2),
+        'BF16': (np.uint16, 2),
+        'I32': (np.int32, 4),
+    }
+
+    results = {}
+    # Thread-local file handles: filepath -> open file object
+    local_handles = {}
+
+    try:
+        for proj_name in ("gate_proj", "up_proj", "down_proj"):
+            prefix = f"language_model.model.layers.{layer_idx}.mlp.switch_mlp.{proj_name}"
+            for attr_name in ("weight", "scales", "biases"):
+                full_key = f"{prefix}.{attr_name}"
+                if full_key not in expert_file_map:
+                    continue
+                filepath = expert_file_map[full_key]
+
+                # Parse header (header_cache is pre-populated, so this is just a dict lookup)
+                header, data_start = header_cache[filepath]
+                meta = header[full_key]
+                shape = meta['shape']
+                dtype_str = meta['dtype']
+                tensor_offsets = meta['data_offsets']
+                tensor_start = data_start + tensor_offsets[0]
+                expert_shape = shape[1:]
+
+                np_dtype, elem_size = NP_DTYPE[dtype_str]
+                expert_elems = 1
+                for d in expert_shape:
+                    expert_elems *= d
+                expert_bytes = expert_elems * elem_size
+
+                # Open file handle per filepath (reuse within this thread)
+                if filepath not in local_handles:
+                    local_handles[filepath] = open(filepath, 'rb')
+                f = local_handles[filepath]
+
+                offset = tensor_start + int(expert_idx) * expert_bytes
+                f.seek(offset)
+                raw = f.read(expert_bytes)
+                np_arr = np.frombuffer(raw, dtype=np_dtype).reshape(expert_shape)
+
+                if dtype_str == 'BF16':
+                    np_f32 = (np_arr.astype(np.uint32) << 16).view(np.float32)
+                    results[(proj_name, attr_name)] = mx.array(np_f32).astype(mx.bfloat16)
+                else:
+                    results[(proj_name, attr_name)] = mx.array(np_arr)
+    finally:
+        for fh in local_handles.values():
+            fh.close()
+
+    return expert_idx, results
 
 
 class ExpertCache:
@@ -968,21 +1042,27 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                     expert_cache.record_miss()
                     uncached_list.append(idx)
 
-            # Read only uncached experts from disk
+            # Read only uncached experts from disk (threaded: one expert per thread)
             switch = layer.mlp.switch_mlp
             if uncached_list:
-                for proj_name in ["gate_proj", "up_proj", "down_proj"]:
-                    prefix = f"language_model.model.layers.{i}.mlp.switch_mlp.{proj_name}"
-                    for attr_name in ["weight", "scales", "biases"]:
-                        full_key = f"{prefix}.{attr_name}"
-                        if full_key not in expert_file_map:
-                            continue
-                        filepath = expert_file_map[full_key]
-                        # Read only uncached experts' byte ranges (no mmap)
-                        fresh = read_expert_slices_direct(filepath, full_key, uncached_list, header_cache, file_handle_cache)
-                        # fresh is [len(uncached_list), ...] — split and cache individually
-                        for j, uidx in enumerate(uncached_list):
-                            expert_cache.put_attr(i, uidx, proj_name, attr_name, fresh[j])
+                # Pre-populate header_cache for all expert files (thread-safe after this)
+                for filepath in set(expert_file_map.values()):
+                    if filepath not in header_cache:
+                        header_cache[filepath] = parse_safetensors_header(filepath)
+
+                # Parallel read: each thread reads all 9 attrs for one expert
+                with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
+                    futures = [
+                        executor.submit(
+                            _read_single_expert_attrs,
+                            expert_idx, i, expert_file_map, header_cache
+                        )
+                        for expert_idx in uncached_list
+                    ]
+                    for future in futures:
+                        eidx, attrs = future.result()
+                        for (proj_name, attr_name), arr in attrs.items():
+                            expert_cache.put_attr(i, eidx, proj_name, attr_name, arr)
 
             # Assemble [num_unique, ...] weight tensors from cache
             for proj_name in ["gate_proj", "up_proj", "down_proj"]:
