@@ -1438,7 +1438,8 @@ def split_layer_entries(entries):
 
 def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_index, model_path,
                                preload_topk=0, cache_gb=20.0, profile=False,
-                               use_pread=False, pread_index=None, pread_fds=None):
+                               use_pread=False, pread_index=None, pread_fds=None,
+                               use_cext=False):
     """Generate tokens with selective expert loading for MoE models.
 
     At startup: pre-load all non-expert weights (~2.3GB) for all layers into DRAM.
@@ -1712,7 +1713,39 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                 layer_io_bytes = 0
 
             if uncached_list:
-                if use_pread and pread_index is not None:
+                if use_cext:
+                    # fast_expert_io C extension path (preadv + coalesced I/O)
+                    import fast_expert_io
+                    t_cext_io = time.time()
+                    cext_results = fast_expert_io.batch_read(i, uncached_list)
+                    cext_io_time = time.time() - t_cext_io
+
+                    t_cext_arr = time.time()
+                    cext_io_bytes = 0
+                    for eidx, comp_dict in cext_results.items():
+                        for comp_name, np_arr in comp_dict.items():
+                            parts = comp_name.split(".")
+                            proj_name = parts[0]
+                            attr_name = parts[1]
+                            cext_io_bytes += np_arr.nbytes
+
+                            if np_arr.dtype == np.uint16:
+                                # BF16: stored as uint16, convert to bfloat16
+                                np_f32 = (np_arr.astype(np.uint32) << 16).view(np.float32)
+                                mx_arr = mx.array(np_f32).astype(mx.bfloat16)
+                            else:
+                                mx_arr = mx.array(np_arr)
+                            expert_cache.put_attr(i, eidx, proj_name, attr_name, mx_arr)
+                    cext_arr_time = time.time() - t_cext_arr
+
+                    token_io_bytes += cext_io_bytes
+                    token_io_seeks += len(uncached_list) * 9  # 9 components per expert
+                    token_io_time += cext_io_time
+                    token_array_time += cext_arr_time
+                    if profile:
+                        layer_io_bytes += cext_io_bytes
+
+                elif use_pread and pread_index is not None:
                     # pread()-based expert loading (bypasses safetensors)
                     batch_results, io_stats = pread_expert_batch(
                         pread_index, pread_fds, i, uncached_list)
@@ -3349,6 +3382,10 @@ def main():
                         help="Use pread()-based expert loading instead of safetensors mmap. "
                              "Requires expert_index.json in working directory. "
                              "Bypasses kernel buffer cache (F_NOCACHE) for direct SSD reads.")
+    parser.add_argument("--use-cext", action="store_true", default=False,
+                        help="Use fast_expert_io C extension for expert loading. "
+                             "Requires expert_index.json and compiled fast_expert_io.so. "
+                             "Uses preadv + coalesced I/O with dedicated thread pool.")
     args = parser.parse_args()
 
     # Validate --cache-gb range
@@ -3462,6 +3499,46 @@ def main():
         print(f"[{fmt_time(time.time() - t_start)}] Loading expert_index.json for pread() path...")
         pread_index, pread_fds = load_expert_index(model_path)
 
+    # Initialize fast_expert_io C extension if requested
+    if args.use_cext and args.mode in ("offload_selective", "speculative"):
+        print(f"[{fmt_time(time.time() - t_start)}] Initializing fast_expert_io C extension...")
+        import fast_expert_io
+
+        # Load expert_index.json (same data as pread path)
+        index_path = Path("expert_index.json")
+        if not index_path.exists():
+            index_path = Path(model_path) / "expert_index.json"
+        if not index_path.exists():
+            print("ERROR: expert_index.json not found. Required for --use-cext.")
+            sys.exit(1)
+        with open(index_path) as f:
+            cext_expert_index = json.load(f)
+
+        # Build file_dict: {filename: full_path}
+        shard_files = set()
+        for tensor_info in cext_expert_index["tensors"].values():
+            shard_files.add(tensor_info["file"])
+        for layer_reads in cext_expert_index.get("expert_reads", {}).values():
+            for comp_info in layer_reads.values():
+                shard_files.add(comp_info["file"])
+
+        resolved_model_path = Path(cext_expert_index.get("model_path", str(model_path)))
+        cext_file_dict = {}
+        for filename in sorted(shard_files):
+            filepath = resolved_model_path / filename
+            if not filepath.exists():
+                filepath = Path(model_path) / filename
+            cext_file_dict[filename] = str(filepath)
+
+        fast_expert_io.init(num_workers=8)
+        fast_expert_io.register_files(cext_file_dict, cext_expert_index)
+        atexit.register(fast_expert_io.shutdown)
+
+        num_cext_layers = len(cext_expert_index.get("expert_reads", {}))
+        print(f"[cext] Initialized: {num_cext_layers} layers, "
+              f"{len(cext_file_dict)} shard files, 8 workers")
+        del cext_expert_index, cext_file_dict
+
     # Generate
     print(f"[{fmt_time(time.time() - t_start)}] Generating {args.tokens} tokens ({args.mode})...")
     print(f"[{fmt_time(time.time() - t_start)}] Prompt: {args.prompt[:80]}{'...' if len(args.prompt) > 80 else ''}")
@@ -3485,7 +3562,8 @@ def main():
                                             profile=args.profile,
                                             use_pread=args.use_pread,
                                             pread_index=pread_index,
-                                            pread_fds=pread_fds)
+                                            pread_fds=pread_fds,
+                                            use_cext=args.use_cext)
     elif args.mode in ("offload", "offload_lazy"):
         # Offload mode: explicit per-layer load -> compute -> clear cycle.
         # Only way to run models larger than DRAM without OS thrashing.
