@@ -123,7 +123,7 @@ static void chat_print_usage(const char *prog) {
     printf("  --manifest PATH      model_weights.json path\n");
     printf("  --vocab PATH         vocab.bin path\n");
     printf("  --k N                Active experts per layer (default: 4)\n");
-    printf("  --cache-entries N    Expert LRU cache size (default: 1500)\n");
+    printf("  --cache-entries N    Expert LRU cache size (default: 2500)\n");
     printf("  --malloc-cache N     Malloc expert cache entries\n");
     printf("  --2bit               Use 2-bit quantized experts\n");
     printf("  --help               This message\n");
@@ -140,7 +140,7 @@ int main(int argc, char **argv) {
         const char *manifest_path = NULL;
         const char *vocab_path = NULL;
         int K = 4;
-        int cache_entries = 500;
+        int cache_entries = 2500;
         int malloc_cache_entries = 0;
 
         static struct option long_options[] = {
@@ -194,13 +194,34 @@ int main(int argc, char **argv) {
             vocab_path = default_vocab;
         }
 
+        // Auto-detect: try 2-bit first if not explicitly set
+        if (!g_use_2bit) {
+            char probe[1024];
+            snprintf(probe, sizeof(probe), "%s/packed_experts_2bit/layer_00.bin", model_path);
+            int probe_fd = open(probe, O_RDONLY);
+            if (probe_fd >= 0) {
+                close(probe_fd);
+                snprintf(probe, sizeof(probe), "%s/packed_experts/layer_00.bin", model_path);
+                int probe4 = open(probe, O_RDONLY);
+                if (probe4 < 0) {
+                    g_use_2bit = 1;
+                } else {
+                    close(probe4);
+                }
+            }
+        }
+
         // ---- Header ----
         printf("==================================================\n");
         printf("  Qwen3.5-397B-A17B Chat (Metal Inference Engine)\n");
         printf("==================================================\n");
         printf("  Model:   %s\n", model_path);
         printf("  Experts: K=%d, %s quantization\n", K, g_use_2bit ? "2-bit" : "4-bit");
-        printf("  Cache:   %d entries\n", malloc_cache_entries > 0 ? malloc_cache_entries : cache_entries);
+        if (malloc_cache_entries > 0) {
+            printf("  Cache:   malloc %d entries\n", malloc_cache_entries);
+        } else {
+            printf("  Cache:   %d entries\n", cache_entries);
+        }
         printf("  Context: %d tokens max\n", MAX_CONV_TOKENS);
         printf("\n  Commands: /quit /exit /clear\n");
         printf("==================================================\n\n");
@@ -241,26 +262,6 @@ int main(int argc, char **argv) {
         void *layer_mmaps[NUM_LAYERS];
         size_t layer_mmap_sizes[NUM_LAYERS];
         int expert_layers_available = 0;
-
-        // Auto-detect: try 2-bit first if not explicitly set
-        if (!g_use_2bit) {
-            char probe[1024];
-            snprintf(probe, sizeof(probe), "%s/packed_experts_2bit/layer_00.bin", model_path);
-            int probe_fd = open(probe, O_RDONLY);
-            if (probe_fd >= 0) {
-                close(probe_fd);
-                // Check if 4-bit exists
-                snprintf(probe, sizeof(probe), "%s/packed_experts/layer_00.bin", model_path);
-                int probe4 = open(probe, O_RDONLY);
-                if (probe4 < 0) {
-                    // Only 2-bit exists — auto-enable
-                    g_use_2bit = 1;
-                    printf("[auto] Using 2-bit experts (4-bit not found)\n");
-                } else {
-                    close(probe4);
-                }
-            }
-        }
 
         for (int i = 0; i < NUM_LAYERS; i++) {
             char path[1024];
