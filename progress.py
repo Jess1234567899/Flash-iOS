@@ -20,7 +20,8 @@ def main():
     for path in ["results.tsv", "metal_infer/results.tsv"]:
         if os.path.exists(path):
             try:
-                df = pd.read_csv(path, sep="\t")
+                cols = ["commit", "model", "params_B", "active_B", "tok_sec", "ttft_ms", "mem_gb", "status", "description"]
+                df = pd.read_csv(path, sep="\t", header=None, names=cols)
                 dfs.append(df)
             except Exception:
                 pass
