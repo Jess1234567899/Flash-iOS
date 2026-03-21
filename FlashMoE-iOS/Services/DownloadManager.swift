@@ -80,9 +80,21 @@ final class DownloadManager: NSObject, @unchecked Sendable {
     // MARK: - Public API
 
     func startDownload(entry: CatalogEntry) {
-        guard activeDownload == nil || activeDownload?.status == .complete else {
-            error = "A download is already in progress"
+        // Allow starting if no active download, or previous one finished/failed
+        if let status = activeDownload?.status, status == .downloading || status == .paused {
+            if activeDownload?.catalogId != entry.id {
+                error = "A different download is already in progress"
+                return
+            }
+            // Same model — resume instead
+            resumeDownload()
             return
+        }
+
+        // Clear stale state from previous download
+        if activeDownload != nil {
+            activeDownload = nil
+            clearPersistedState()
         }
 
         // Check disk space
@@ -326,49 +338,96 @@ extension DownloadManager: URLSessionDownloadDelegate {
         downloadTask: URLSessionDownloadTask,
         didFinishDownloadingTo location: URL
     ) {
-        guard var state = activeDownload,
-              let entry = currentEntry,
+        guard let entry = currentEntry,
               let filename = downloadTask.taskDescription else { return }
 
-        // Move from temp to model directory
-        let dest = modelDirectory(for: entry.id).appendingPathComponent(filename)
-        let fm = FileManager.default
-        try? fm.removeItem(at: dest) // remove partial if exists
-        do {
-            try fm.moveItem(at: location, to: dest)
-        } catch {
-            self.error = "Failed to save \(filename): \(error.localizedDescription)"
-            state.status = .failed
-            state.errorMessage = self.error
-            activeDownload = state
-            persistState()
+        // Check HTTP status code — HuggingFace returns 200 HTML pages for 404s
+        if let httpResponse = downloadTask.response as? HTTPURLResponse,
+           httpResponse.statusCode != 200 {
+            let statusCode = httpResponse.statusCode
+            DispatchQueue.main.async { [weak self] in
+                guard let self, var state = self.activeDownload else { return }
+                self.error = "HTTP \(statusCode) downloading \(filename)"
+                state.status = .failed
+                state.errorMessage = self.error
+                self.activeDownload = state
+                self.persistState()
+            }
             return
         }
 
-        // Validate file size
-        if let file = entry.files.first(where: { $0.filename == filename }) {
-            let attrs = try? fm.attributesOfItem(atPath: dest.path)
-            let actualSize = attrs?[.size] as? UInt64 ?? 0
-            // Allow 1% tolerance for Content-Length vs actual
-            if actualSize > 0 && file.sizeBytes > 0 && actualSize < file.sizeBytes * 9 / 10 {
-                self.error = "File \(filename) is too small (\(actualSize) vs expected \(file.sizeBytes))"
-                state.status = .failed
-                state.errorMessage = self.error
-                activeDownload = state
-                persistState()
-                return
-            }
-            state.completedBytes += actualSize > 0 ? actualSize : file.sizeBytes
+        // Move from temp to model directory (must happen synchronously before this method returns)
+        let dest = modelDirectory(for: entry.id).appendingPathComponent(filename)
+        let fm = FileManager.default
+        try? fm.removeItem(at: dest)
+
+        var moveError: Error?
+        do {
+            try fm.moveItem(at: location, to: dest)
+        } catch {
+            moveError = error
         }
 
-        state.completedFiles.append(filename)
-        state.currentFile = nil
-        activeDownload = state
-        bytesDownloaded = state.completedBytes
-        persistState()
+        // Compute file size on this thread before dispatching
+        let actualSize: UInt64
+        if moveError == nil {
+            let attrs = try? fm.attributesOfItem(atPath: dest.path)
+            actualSize = attrs?[.size] as? UInt64 ?? 0
+        } else {
+            actualSize = 0
+        }
 
-        // Start next file
-        downloadNextFile()
+        let expectedSize = entry.files.first(where: { $0.filename == filename })?.sizeBytes ?? 0
+
+        // Check if we got an HTML error page instead of the actual file
+        // (HuggingFace sometimes returns 200 with HTML for missing LFS files)
+        if actualSize > 0 && actualSize < 10_000 && expectedSize > 100_000 {
+            // Downloaded file is suspiciously small — likely an error page
+            try? fm.removeItem(at: dest)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, var state = self.activeDownload else { return }
+                self.error = "File \(filename) not found on server (got \(actualSize) bytes, expected \(self.formatBytes(expectedSize)))"
+                state.status = .failed
+                state.errorMessage = self.error
+                self.activeDownload = state
+                self.persistState()
+            }
+            return
+        }
+
+        // All @Observable mutations on main thread
+        DispatchQueue.main.async { [weak self] in
+            guard let self, var state = self.activeDownload else { return }
+
+            if let moveError {
+                self.error = "Failed to save \(filename): \(moveError.localizedDescription)"
+                state.status = .failed
+                state.errorMessage = self.error
+                self.activeDownload = state
+                self.persistState()
+                return
+            }
+
+            // Validate file size
+            if actualSize > 0 && expectedSize > 0 && actualSize < expectedSize * 9 / 10 {
+                self.error = "File \(filename) is too small (\(actualSize) vs expected \(expectedSize))"
+                state.status = .failed
+                state.errorMessage = self.error
+                self.activeDownload = state
+                self.persistState()
+                return
+            }
+
+            state.completedBytes += actualSize > 0 ? actualSize : expectedSize
+            state.completedFiles.append(filename)
+            state.currentFile = nil
+            self.activeDownload = state
+            self.bytesDownloaded = state.completedBytes
+            self.persistState()
+
+            // Start next file
+            self.downloadNextFile()
+        }
     }
 
     func urlSession(
@@ -378,47 +437,58 @@ extension DownloadManager: URLSessionDownloadDelegate {
         totalBytesWritten: Int64,
         totalBytesExpectedToWrite: Int64
     ) {
-        // Per-file progress
-        if totalBytesExpectedToWrite > 0 {
-            currentFileProgress = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
-        }
-
-        // Overall progress
+        // Compute values on background thread
+        let fileProgress = totalBytesExpectedToWrite > 0
+            ? Double(totalBytesWritten) / Double(totalBytesExpectedToWrite) : 0
         let completed = activeDownload?.completedBytes ?? 0
-        let current = UInt64(totalBytesWritten)
-        bytesDownloaded = completed + current
-        if totalBytes > 0 {
-            overallProgress = Double(bytesDownloaded) / Double(totalBytes)
-        }
+        let currentTotal = completed + UInt64(totalBytesWritten)
+        let total = totalBytes
+        let overall = total > 0 ? Double(currentTotal) / Double(total) : 0
 
-        // Download speed (sampled every 2 seconds)
+        // Speed sampling (non-observable state, safe on background)
+        var newSpeed: Double?
         if let sampleTime = speedSampleTime, Date().timeIntervalSince(sampleTime) >= 2 {
             let elapsed = Date().timeIntervalSince(sampleTime)
-            let delta = bytesDownloaded - speedSampleBytes
-            downloadSpeed = Double(delta) / elapsed
+            let delta = currentTotal - speedSampleBytes
+            newSpeed = Double(delta) / elapsed
             speedSampleTime = Date()
-            speedSampleBytes = bytesDownloaded
+            speedSampleBytes = currentTotal
+        }
+
+        // All @Observable mutations on main thread
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.currentFileProgress = fileProgress
+            self.bytesDownloaded = currentTotal
+            self.overallProgress = overall
+            if let newSpeed {
+                self.downloadSpeed = newSpeed
+            }
         }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
-        guard let error else { return } // success handled in didFinishDownloadingTo
+        guard let error else { return }
 
         let nsError = error as NSError
         if nsError.code == NSURLErrorCancelled {
-            // User-initiated cancel or pause — resume data handled in pauseDownload()
             return
         }
 
-        // Save resume data if available
-        if let resumeData = nsError.userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
-            self.resumeData = resumeData
+        // Save resume data if available (non-observable)
+        if let data = nsError.userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
+            self.resumeData = data
         }
 
-        self.error = error.localizedDescription
-        activeDownload?.status = .failed
-        activeDownload?.errorMessage = error.localizedDescription
-        persistState()
+        let errorMsg = error.localizedDescription
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.error = errorMsg
+            self.activeDownload?.status = .failed
+            self.activeDownload?.errorMessage = errorMsg
+            self.persistState()
+        }
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {

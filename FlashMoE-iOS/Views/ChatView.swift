@@ -29,6 +29,7 @@ struct ChatView: View {
     @State private var isGenerating = false
     @State private var showStats = false
     @State private var showModelInfo = false
+    @State private var showProfiler = false
     @FocusState private var inputFocused: Bool
 
     var body: some View {
@@ -44,6 +45,7 @@ struct ChatView: View {
                     }
                     .padding()
                 }
+                .onTapGesture { inputFocused = false }
                 .onChange(of: messages.count) {
                     if let last = messages.last {
                         withAnimation {
@@ -91,6 +93,14 @@ struct ChatView: View {
             .padding(.horizontal)
             .padding(.vertical, 8)
         }
+        .overlay(alignment: .bottom) {
+            if showProfiler {
+                ProfilerView(engine: engine)
+                    .padding(.bottom, 80)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: showProfiler)
         .navigationTitle("Flash-MoE")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -104,6 +114,9 @@ struct ChatView: View {
                     Button("New Chat", systemImage: "plus.message") {
                         messages.removeAll()
                         engine.reset()
+                    }
+                    Button(showProfiler ? "Hide Profiler" : "Profiler", systemImage: "gauge.with.dots.needle.50percent") {
+                        showProfiler.toggle()
                     }
                     Button("Show Stats", systemImage: "chart.bar") {
                         showStats.toggle()
@@ -133,12 +146,41 @@ struct ChatView: View {
         let assistantIndex = messages.count - 1
 
         Task {
-            let stream = engine.generate(prompt: text, maxTokens: 500)
+            // Build Qwen chat template prompt from conversation history
+            let formattedPrompt = buildChatPrompt(userMessage: text)
+            let stream = engine.generate(prompt: formattedPrompt, maxTokens: 500)
             for await token in stream {
-                messages[assistantIndex].text += token.text
+                // Strip special tokens that leak through
+                let clean = token.text
+                    .replacingOccurrences(of: "<|im_end|>", with: "")
+                    .replacingOccurrences(of: "<|im_start|>", with: "")
+                    .replacingOccurrences(of: "<|endoftext|>", with: "")
+                if !clean.isEmpty {
+                    messages[assistantIndex].text += clean
+                }
             }
             isGenerating = false
         }
+    }
+
+    /// Format conversation as Qwen chat template
+    private func buildChatPrompt(userMessage: String) -> String {
+        var prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+
+        // Include conversation history (skip the empty assistant message we just appended)
+        for msg in messages.dropLast() {
+            switch msg.role {
+            case .user:
+                prompt += "<|im_start|>user\n\(msg.text)<|im_end|>\n"
+            case .assistant:
+                if !msg.text.isEmpty {
+                    prompt += "<|im_start|>assistant\n\(msg.text)<|im_end|>\n"
+                }
+            }
+        }
+
+        prompt += "<|im_start|>assistant\n"
+        return prompt
     }
 }
 
@@ -146,26 +188,95 @@ struct ChatView: View {
 
 struct MessageBubble: View {
     let message: ChatMessage
+    @State private var showThinking = false
+
+    /// Split text into visible reply and thinking content
+    private var parsedContent: (think: String?, reply: String) {
+        let text = message.text
+        // Match <think>...</think> blocks
+        guard let thinkStart = text.range(of: "<think>"),
+              let thinkEnd = text.range(of: "</think>") else {
+            // No complete think block — check if still streaming thinking
+            if text.hasPrefix("<think>") {
+                let thinkBody = String(text.dropFirst("<think>".count))
+                return (think: thinkBody, reply: "")
+            }
+            return (think: nil, reply: text)
+        }
+        let thinkBody = String(text[thinkStart.upperBound..<thinkEnd.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let reply = String(text[thinkEnd.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (think: thinkBody, reply: reply)
+    }
 
     var body: some View {
         HStack {
             if message.role == .user { Spacer(minLength: 60) }
 
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
-                Text(message.text)
+                // Thinking disclosure (assistant only)
+                if message.role == .assistant, let thinkText = parsedContent.think, !thinkText.isEmpty {
+                    DisclosureGroup(isExpanded: $showThinking) {
+                        Text(thinkText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                    } label: {
+                        Label("Thinking...", systemImage: "brain")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(message.role == .user ? Color.blue : Color(.systemGray5))
-                    .foregroundStyle(message.role == .user ? .white : .primary)
-                    .clipShape(RoundedRectangle(cornerRadius: 18))
+                    .padding(.vertical, 6)
+                    .background(Color(.systemGray6))
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                }
 
-                if message.text.isEmpty {
-                    ProgressView()
-                        .padding(.leading, 8)
+                // Main message text
+                let displayText = message.role == .assistant ? parsedContent.reply : message.text
+                if !displayText.isEmpty {
+                    Text(displayText)
+                        .textSelection(.enabled)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(message.role == .user ? Color.blue : Color(.systemGray5))
+                        .foregroundStyle(message.role == .user ? .white : .primary)
+                        .clipShape(RoundedRectangle(cornerRadius: 18))
+                }
+
+                if message.text.isEmpty && message.role == .assistant {
+                    ThinkingIndicator()
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(Color(.systemGray5))
+                        .clipShape(RoundedRectangle(cornerRadius: 18))
                 }
             }
 
             if message.role == .assistant { Spacer(minLength: 60) }
+        }
+    }
+}
+
+// MARK: - Thinking Indicator
+
+struct ThinkingIndicator: View {
+    @State private var dotCount = 0
+    private let timer = Timer.publish(every: 0.4, on: .main, in: .common).autoconnect()
+    private let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(frames[dotCount % frames.count])
+                .font(.system(.body, design: .monospaced))
+                .foregroundStyle(.secondary)
+            Text("Thinking")
+                .font(.system(.body, design: .monospaced))
+                .foregroundStyle(.secondary)
+        }
+        .onReceive(timer) { _ in
+            dotCount += 1
         }
     }
 }

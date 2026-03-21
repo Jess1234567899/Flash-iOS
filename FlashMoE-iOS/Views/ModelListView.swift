@@ -69,11 +69,13 @@ struct ModelListView: View {
 
             // Download section
             Section("Download from HuggingFace") {
-                ForEach(availableCatalogEntries) { entry in
+                ForEach(ModelCatalog.models) { entry in
+                    let hasActiveDownload = downloadManager.activeDownload?.catalogId == entry.id
+                        && downloadManager.activeDownload?.status != .complete
                     ModelDownloadRow(
                         entry: entry,
                         downloadManager: downloadManager,
-                        isDownloaded: downloadManager.isModelDownloaded(entry.id)
+                        isDownloaded: !hasActiveDownload && downloadManager.isModelDownloaded(entry.id)
                     )
                 }
             }
@@ -102,13 +104,6 @@ struct ModelListView: View {
             if newStatus == .complete {
                 scanForModels()
             }
-        }
-    }
-
-    private var availableCatalogEntries: [CatalogEntry] {
-        let localNames = Set(localModels.map { $0.name })
-        return ModelCatalog.models.filter { entry in
-            !localNames.contains(entry.id)
         }
     }
 

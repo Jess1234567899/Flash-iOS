@@ -17,9 +17,10 @@
 		AA1111111111111111111111 /* ModelCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA2222222222222222222222 /* ModelCatalog.swift */; };
 		BB1111111111111111111111 /* DownloadManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB2222222222222222222222 /* DownloadManager.swift */; };
 		CC1111111111111111111111 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC2222222222222222222222 /* AppDelegate.swift */; };
-		DD1111111111111111111111 /* ModelDownloadRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD2222222222222222222222 /* ModelDownloadRow.swift */; };
 		D2F140EBFBCC62B37BDBCB7F /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3321AD5929C6B6D4FAD446C8 /* Foundation.framework */; };
-		D8242F5999552BC228A650CE /* shaders.metal in Resources */ = {isa = PBXBuildFile; fileRef = EEC822B6F9CE0BABA49E989B /* shaders.metal */; };
+		D8242F5999552BC228A650CE /* shaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = EEC822B6F9CE0BABA49E989B /* shaders.metal */; };
+		DD1111111111111111111111 /* ModelDownloadRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD2222222222222222222222 /* ModelDownloadRow.swift */; };
+		EE1111111111111111111111 /* ProfilerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE2222222222222222222222 /* ProfilerView.swift */; };
 		E73BB005AD9F878023B7F75E /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 51FB34EBC20226BA8269877A /* Accelerate.framework */; };
 		F00087500AE558979B35EE06 /* FlashMoEEngine.m in Sources */ = {isa = PBXBuildFile; fileRef = 50DF36AC37579556033D375F /* FlashMoEEngine.m */; };
 /* End PBXBuildFile section */
@@ -37,14 +38,15 @@
 		82BDA279F2267A8FD313D3C3 /* FlashMoE.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = FlashMoE.entitlements; sourceTree = "<group>"; };
 		8A8F6936F5C735B8856277A2 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		8EAF41B16BD4314D3642DC53 /* FlashMoEApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FlashMoEApp.swift; sourceTree = "<group>"; };
-		BAC1A43E0715A9CDE325FFC0 /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
-		DDD107A34A4DAEABC7E9ECFB /* ModelListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelListView.swift; sourceTree = "<group>"; };
-		DEE08D3053B24D1E206627F9 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		EEC822B6F9CE0BABA49E989B /* shaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = shaders.metal; sourceTree = "<group>"; };
 		AA2222222222222222222222 /* ModelCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCatalog.swift; sourceTree = "<group>"; };
+		BAC1A43E0715A9CDE325FFC0 /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
 		BB2222222222222222222222 /* DownloadManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadManager.swift; sourceTree = "<group>"; };
 		CC2222222222222222222222 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		DD2222222222222222222222 /* ModelDownloadRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelDownloadRow.swift; sourceTree = "<group>"; };
+		EE2222222222222222222222 /* ProfilerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfilerView.swift; sourceTree = "<group>"; };
+		DDD107A34A4DAEABC7E9ECFB /* ModelListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelListView.swift; sourceTree = "<group>"; };
+		DEE08D3053B24D1E206627F9 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		EEC822B6F9CE0BABA49E989B /* shaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = shaders.metal; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -123,22 +125,6 @@
 			path = App;
 			sourceTree = "<group>";
 		};
-		AA3333333333333333333333 /* Models */ = {
-			isa = PBXGroup;
-			children = (
-				AA2222222222222222222222 /* ModelCatalog.swift */,
-			);
-			path = Models;
-			sourceTree = "<group>";
-		};
-		BB3333333333333333333333 /* Services */ = {
-			isa = PBXGroup;
-			children = (
-				BB2222222222222222222222 /* DownloadManager.swift */,
-			);
-			path = Services;
-			sourceTree = "<group>";
-		};
 		9072059C570A7ED56A540CBE = {
 			isa = PBXGroup;
 			children = (
@@ -163,8 +149,25 @@
 				2AEBDCE15020A40A8451CB5A /* ContentView.swift */,
 				DD2222222222222222222222 /* ModelDownloadRow.swift */,
 				DDD107A34A4DAEABC7E9ECFB /* ModelListView.swift */,
+				EE2222222222222222222222 /* ProfilerView.swift */,
 			);
 			path = Views;
+			sourceTree = "<group>";
+		};
+		AA3333333333333333333333 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				AA2222222222222222222222 /* ModelCatalog.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		BB3333333333333333333333 /* Services */ = {
+			isa = PBXGroup;
+			children = (
+				BB2222222222222222222222 /* DownloadManager.swift */,
+			);
+			path = Services;
 			sourceTree = "<group>";
 		};
 		EDA325EB4F586262787DC634 /* FlashMoEEngine */ = {
@@ -232,7 +235,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				A40E8D436A3EEDB8B04CDC44 /* Assets.xcassets in Resources */,
-				D8242F5999552BC228A650CE /* shaders.metal in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -243,6 +245,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D8242F5999552BC228A650CE /* shaders.metal in Sources */,
 				CC1111111111111111111111 /* AppDelegate.swift in Sources */,
 				86FB8D83EC8F2AA092081685 /* ChatView.swift in Sources */,
 				15BBE610777A6EF58279A4E3 /* ContentView.swift in Sources */,
@@ -253,6 +256,7 @@
 				AA1111111111111111111111 /* ModelCatalog.swift in Sources */,
 				DD1111111111111111111111 /* ModelDownloadRow.swift in Sources */,
 				23E305445AFD3D5FB1A5E5FC /* ModelListView.swift in Sources */,
+				EE1111111111111111111111 /* ProfilerView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -391,6 +395,7 @@
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = Resources/FlashMoE.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = YMCRS53QKE;
 				GCC_OPTIMIZATION_LEVEL = 2;
 				GCC_WARN_INHIBIT_ALL_WARNINGS = NO;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -430,6 +435,7 @@
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = Resources/FlashMoE.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = YMCRS53QKE;
 				GCC_OPTIMIZATION_LEVEL = 2;
 				GCC_WARN_INHIBIT_ALL_WARNINGS = NO;
 				GENERATE_INFOPLIST_FILE = YES;

@@ -1087,6 +1087,27 @@ static void init_tokenizer(void) {
             }
         }
     }
+    // Try model directory (iOS: tokenizer downloaded with model)
+    if (cfg.model_path[0]) {
+        char model_tok[1024];
+        snprintf(model_tok, sizeof(model_tok), "%s/tokenizer.bin", cfg.model_path);
+        if (access(model_tok, R_OK) == 0) {
+            if (bpe_load(&g_tokenizer, model_tok) == 0) {
+                g_tokenizer_loaded = 1;
+                return;
+            }
+        }
+    }
+    // Try app bundle (iOS)
+    @autoreleasepool {
+        NSString *bundlePath = [[NSBundle mainBundle] pathForResource:@"tokenizer" ofType:@"bin"];
+        if (bundlePath) {
+            if (bpe_load(&g_tokenizer, [bundlePath UTF8String]) == 0) {
+                g_tokenizer_loaded = 1;
+                return;
+            }
+        }
+    }
     fprintf(stderr, "WARNING: tokenizer.bin not found, tokenization will fail\n");
 }
 
@@ -1434,30 +1455,38 @@ static MetalCtx *metal_setup(void) {
         free(ctx); return NULL;
     }
 
-    // Compile shaders from source
+    // Load Metal shaders
     NSError *error = nil;
-    NSArray *paths = @[@"shaders.metal", @"metal_infer/shaders.metal"];
-    NSString *src = nil;
-    for (NSString *p in paths) {
-        src = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:&error];
-        if (src) break;
-    }
-    if (!src) {
-        fprintf(stderr, "ERROR: Cannot find shaders.metal\n");
-        free(ctx); return NULL;
-    }
-
-    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
-    opts.mathMode = MTLMathModeFast;
-    opts.languageVersion = MTLLanguageVersion3_1;
     double t0 = now_ms();
-    ctx->library = [ctx->device newLibraryWithSource:src options:opts error:&error];
-    if (!ctx->library) {
-        fprintf(stderr, "ERROR: Shader compile failed: %s\n",
-                [[error localizedDescription] UTF8String]);
-        free(ctx); return NULL;
+
+    // Try pre-compiled default.metallib first (iOS app bundle, or macOS with embedded metallib)
+    ctx->library = [ctx->device newDefaultLibrary];
+    if (ctx->library) {
+        printf("[metal] Loaded pre-compiled Metal library: %.0f ms\n", now_ms() - t0);
+    } else {
+        // Fallback: compile shaders from source at runtime (macOS CLI)
+        NSArray *paths = @[@"shaders.metal", @"metal_infer/shaders.metal"];
+        NSString *src = nil;
+        for (NSString *p in paths) {
+            src = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:&error];
+            if (src) break;
+        }
+        if (!src) {
+            fprintf(stderr, "ERROR: Cannot find shaders.metal\n");
+            free(ctx); return NULL;
+        }
+
+        MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+        opts.mathMode = MTLMathModeFast;
+        opts.languageVersion = MTLLanguageVersion3_1;
+        ctx->library = [ctx->device newLibraryWithSource:src options:opts error:&error];
+        if (!ctx->library) {
+            fprintf(stderr, "ERROR: Shader compile failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            free(ctx); return NULL;
+        }
+        printf("[metal] Shader compile: %.0f ms\n", now_ms() - t0);
     }
-    printf("[metal] Shader compile: %.0f ms\n", now_ms() - t0);
 
     // Create pipelines
     id<MTLComputePipelineState> (^makePipe)(NSString *) = ^(NSString *name) {

@@ -107,9 +107,15 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
         load_model_config(model_path);
         alloc_tracking_arrays();
 
-        // Apply config overrides
+        // Apply config overrides — cap context length for iOS memory constraints
         if (config->max_context > 0) {
             cfg.max_seq_len = config->max_context;
+        }
+        // iOS safety: cap at 2048 to avoid multi-GB KV cache allocations
+        // (128k context = ~2.5GB KV caches alone, exceeds iPhone memory budget)
+        if (cfg.max_seq_len > 2048) {
+            NSLog(@"[FlashMoE] Capping max_seq_len from %d to 2048 for iOS memory constraints", cfg.max_seq_len);
+            cfg.max_seq_len = 2048;
         }
         if (config->think_budget > 0) {
             g_think_budget = config->think_budget;
