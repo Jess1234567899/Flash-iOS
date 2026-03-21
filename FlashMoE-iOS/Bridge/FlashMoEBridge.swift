@@ -234,6 +234,96 @@ final class FlashMoEEngine: @unchecked Sendable {
         }
     }
 
+    /// Generate continuation — reuses KV cache from previous turns.
+    /// Returns nil if context is full (caller should reset and use generate instead).
+    func generateContinuation(userMessage: String, maxTokens: Int = 200) -> AsyncStream<GenerationToken> {
+        AsyncStream { continuation in
+            guard let ctx = context, state == .ready else {
+                continuation.finish()
+                return
+            }
+
+            DispatchQueue.main.async {
+                self.state = .generating
+                self.tokensGenerated = 0
+                self.tokensPerSecond = 0
+                self.isGenerating = true
+            }
+
+            nonisolated(unsafe) let ctxForCancel = ctx
+            continuation.onTermination = { @Sendable _ in
+                flashmoe_cancel(ctxForCancel)
+            }
+
+            engineQueue.async { [weak self] in
+                let userDataPtr = Unmanaged.passRetained(
+                    TokenCallbackContext(continuation: continuation, engine: self)
+                ).toOpaque()
+
+                let result = flashmoe_generate_continuation(
+                    ctx,
+                    userMessage,
+                    Int32(maxTokens),
+                    { tokenText, tokenId, tokensGenerated, tokensPerSecond, userData -> Int32 in
+                        guard let userData else { return 1 }
+                        let context = Unmanaged<TokenCallbackContext>.fromOpaque(userData)
+                            .takeUnretainedValue()
+
+                        guard let text = tokenText else { return 0 }
+                        let token = GenerationToken(
+                            text: String(cString: text),
+                            tokenId: Int(tokenId),
+                            tokensGenerated: Int(tokensGenerated),
+                            tokensPerSecond: tokensPerSecond
+                        )
+
+                        if let engine = context.engine {
+                            DispatchQueue.main.async {
+                                engine.tokensGenerated = Int(tokensGenerated)
+                                engine.tokensPerSecond = tokensPerSecond
+                            }
+                        }
+
+                        context.continuation.yield(token)
+                        return 0
+                    },
+                    userDataPtr
+                )
+
+                Unmanaged<TokenCallbackContext>.fromOpaque(userDataPtr).release()
+
+                // -2 = context full, signal via empty stream (caller handles reset)
+                if result == -2 {
+                    DispatchQueue.main.async {
+                        self?.state = .ready
+                        self?.isGenerating = false
+                    }
+                    continuation.finish()
+                    return
+                }
+
+                var stats = FlashMoEStats()
+                flashmoe_get_stats(ctx, &stats)
+
+                DispatchQueue.main.async {
+                    self?.timeToFirstToken = stats.ttft_ms
+                    self?.tokensPerSecond = stats.tokens_per_second
+                    self?.tokensGenerated = Int(stats.tokens_generated)
+                    self?.state = .ready
+                    self?.isGenerating = false
+                }
+
+                continuation.finish()
+            }
+        }
+    }
+
+    /// Whether the engine has conversation state that can be continued
+    var canContinue: Bool {
+        guard let ctx = context else { return false }
+        return flashmoe_turn_count(ctx) > 0
+    }
+
     /// Cancel an in-progress generation
     func cancel() {
         guard let ctx = context, isGenerating else { return }

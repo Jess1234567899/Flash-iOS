@@ -486,8 +486,9 @@ static uint64_t *g_cache_last_evict_token = NULL;
 static int *g_pred_experts = NULL;
 static int *g_pred_count = NULL;
 
-// Hardware tuning constants (not model-specific)
-#define GPU_KV_SEQ  8192
+// GPU KV cache sequence length — set from cfg.max_seq_len in metal_setup()
+// Default 8192 for desktop, iOS overrides via max_seq_len cap
+static int GPU_KV_SEQ = 8192;
 
 // Helper macros for flattened 2D access
 #define FREQ(l, e)           g_expert_freq[(l) * cfg.num_experts + (e)]
@@ -1436,6 +1437,12 @@ typedef struct {
 static MetalCtx *g_metal = NULL;
 
 static MetalCtx *metal_setup(void) {
+    // Set GPU KV cache size from model config (avoids over-allocating on iOS)
+    if (cfg.max_seq_len > 0 && cfg.max_seq_len < GPU_KV_SEQ) {
+        GPU_KV_SEQ = cfg.max_seq_len;
+    }
+    printf("[metal] GPU_KV_SEQ = %d\n", GPU_KV_SEQ);
+
     MetalCtx *ctx = calloc(1, sizeof(MetalCtx));
     // Allocate dynamic buffer arrays based on config
     ctx->buf_kv_k       = (__strong id<MTLBuffer> *)calloc(cfg.num_full_attn_layers, sizeof(id<MTLBuffer>));
@@ -6174,6 +6181,22 @@ static void freq_print_analysis(int K) {
         }
         fprintf(stderr, "\n");
     }
+}
+
+// Tokenize a continuation turn (available in both CLI and iOS modes).
+// Prefixes with \n<|im_start|>user\n to start new turn, assumes prior assistant
+// turn's EOS/<|im_end|> is already in the KV cache state.
+static PromptTokens *tokenize_continuation_turn_shared(const char *user_content) {
+    const char *prefix = "\n<|im_start|>user\n";
+    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
+
+    size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
+    char *prompt = malloc(prompt_len);
+    if (!prompt) return NULL;
+    snprintf(prompt, prompt_len, "%s%s%s", prefix, user_content, suffix);
+    PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
+    free(prompt);
+    return pt;
 }
 
 #ifndef CHAT_MODE

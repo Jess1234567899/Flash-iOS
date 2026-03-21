@@ -89,6 +89,17 @@ int flashmoe_generate(
     void *user_data
 );
 
+// Generate continuation — reuses KV cache from previous turns.
+// Only processes the new user turn, skipping re-prefill of history.
+// The user_content should be raw text (not formatted with chat template).
+int flashmoe_generate_continuation(
+    FlashMoEContext *ctx,
+    const char *user_content,
+    int max_tokens,
+    FlashMoETokenCallback callback,
+    void *user_data
+);
+
 // Cancel an in-progress generation. Safe to call from any thread.
 void flashmoe_cancel(FlashMoEContext *ctx);
 
@@ -105,6 +116,9 @@ void flashmoe_get_stats(FlashMoEContext *ctx, FlashMoEStats *stats);
 // Check if a model directory is valid (has config.json, packed_experts/, etc.)
 // Returns 0 if valid, -1 if not.
 int flashmoe_validate_model(const char *model_path);
+
+// Get the current turn count (0 = no history, >0 = can use continuation).
+int flashmoe_turn_count(FlashMoEContext *ctx);
 
 // Get a human-readable error string for the last error.
 const char *flashmoe_last_error(FlashMoEContext *ctx);

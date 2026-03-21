@@ -16,6 +16,7 @@
 
 #include "FlashMoEEngine.h"
 #include <stdatomic.h>
+#include <os/proc.h>
 
 // ============================================================================
 // FlashMoEContext — wraps engine state for the public C API
@@ -39,6 +40,10 @@ struct FlashMoEContext {
     float *logits;                 // [vocab_size] logits buffer
     uint16_t *final_norm_w;        // pointer into wf (not owned)
     int K;                         // num experts per token
+
+    // Conversation state (for KV cache reuse)
+    int current_pos;               // sequence position for RoPE (persists across turns)
+    int turn_count;                // 0 = fresh session, >0 = has history
 
     // Generation stats
     double tokens_per_second;
@@ -111,11 +116,27 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
         if (config->max_context > 0) {
             cfg.max_seq_len = config->max_context;
         }
-        // iOS safety: cap at 2048 to avoid multi-GB KV cache allocations
-        // (128k context = ~2.5GB KV caches alone, exceeds iPhone memory budget)
-        if (cfg.max_seq_len > 2048) {
-            NSLog(@"[FlashMoE] Capping max_seq_len from %d to 2048 for iOS memory constraints", cfg.max_seq_len);
-            cfg.max_seq_len = 2048;
+        // iOS: adaptive context length based on available device memory
+        // KV cost per position = num_kv_heads * head_dim * 4 bytes * 2 (k+v) * num_full_attn_layers * 2 (CPU+GPU)
+        {
+            size_t avail = os_proc_available_memory();
+            size_t kv_cost_per_pos = (size_t)cfg.num_kv_heads * cfg.head_dim * sizeof(float)
+                                     * 2  // k + v
+                                     * cfg.num_full_attn_layers
+                                     * 2; // CPU + GPU mirror
+            // Budget: 25% of available memory for KV caches
+            size_t kv_budget = avail / 4;
+            int adaptive_max = (int)(kv_budget / kv_cost_per_pos);
+            // Clamp to powers of 2 for clean allocation: 512, 1024, 2048, 4096, 8192
+            int capped = 512;
+            for (int p = 512; p <= 8192; p *= 2) {
+                if (p <= adaptive_max) capped = p;
+            }
+            if (cfg.max_seq_len > capped) {
+                NSLog(@"[FlashMoE] Adaptive context: %d → %d (%.0f MB available, KV cost %.0f bytes/pos)",
+                      cfg.max_seq_len, capped, avail / 1e6, (double)kv_cost_per_pos);
+                cfg.max_seq_len = capped;
+            }
         }
         if (config->think_budget > 0) {
             g_think_budget = config->think_budget;
@@ -536,6 +557,221 @@ int flashmoe_generate(
             ctx->tokens_per_second = (ctx->tokens_generated - 1) * 1000.0 / gen_elapsed;
         }
 
+        // Persist state for KV cache reuse in next turn
+        ctx->current_pos = pos;
+        ctx->turn_count++;
+
+        free(pt->ids);
+        free(pt);
+
+        return ctx->tokens_generated;
+    }
+}
+
+// ============================================================================
+// Continuation generation — reuses KV cache from previous turns
+// ============================================================================
+
+int flashmoe_generate_continuation(
+    FlashMoEContext *ctx,
+    const char *user_content,
+    int max_tokens,
+    FlashMoETokenCallback callback,
+    void *user_data
+) {
+    if (!ctx || !ctx->loaded || !user_content) {
+        if (ctx) snprintf(ctx->last_error, sizeof(ctx->last_error), "Engine not loaded or invalid arguments");
+        return -1;
+    }
+    if (ctx->turn_count == 0) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error), "No previous turn — use flashmoe_generate first");
+        return -1;
+    }
+
+    @autoreleasepool {
+        atomic_store(&ctx->cancelled, 0);
+        ctx->tokens_generated = 0;
+        ctx->tokens_per_second = 0;
+
+        double t0 = now_ms();
+
+        // Tokenize only the new turn (with continuation markers)
+        PromptTokens *pt = tokenize_continuation_turn_shared(user_content);
+        if (!pt) {
+            snprintf(ctx->last_error, sizeof(ctx->last_error), "Failed to tokenize continuation turn");
+            return -1;
+        }
+
+        int K = ctx->K;
+        int pos = ctx->current_pos;  // Resume from where we left off
+
+        // Check we have room in the KV cache
+        if (pos + pt->count + max_tokens > cfg.max_seq_len) {
+            NSLog(@"[FlashMoE] Context full (%d + %d + %d > %d), resetting to fresh generation",
+                  pos, pt->count, max_tokens, cfg.max_seq_len);
+            free(pt->ids); free(pt);
+            // Fall back to full generation with chat template
+            // Caller should handle this by using flashmoe_generate instead
+            snprintf(ctx->last_error, sizeof(ctx->last_error), "Context window full, reset required");
+            return -2;  // Signal to caller: context full, need reset
+        }
+
+        // NOTE: No reset_delta_net_state() — reuse KV caches and linear attention state
+
+        // ---- Prefill continuation tokens ----
+        float *embed_batch = NULL;
+        if (pt->count > 1) {
+            embed_batch = malloc((size_t)pt->count * cfg.hidden_dim * sizeof(float));
+            for (int i = 0; i < pt->count; i++) {
+                embed_lookup(ctx->wf, pt->ids[i], embed_batch + (size_t)i * cfg.hidden_dim);
+            }
+        }
+
+        if (pt->count > 1) {
+            for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) {
+                if (atomic_load(&ctx->cancelled)) {
+                    free(embed_batch);
+                    free(pt->ids); free(pt);
+                    return ctx->tokens_generated;
+                }
+
+                memcpy(ctx->hidden, embed_batch + (size_t)token_idx * cfg.hidden_dim,
+                       cfg.hidden_dim * sizeof(float));
+
+                for (int layer = 0; layer < cfg.num_layers; layer++) {
+                    int is_full = cfg.is_full_attn[layer];
+                    fused_layer_forward(ctx->wf, layer, ctx->hidden,
+                                        is_full ? ctx->kv_caches[layer] : NULL,
+                                        is_full ? NULL : ctx->layer_states[layer],
+                                        pos,
+                                        ctx->layer_mmaps[layer] != MAP_FAILED ? ctx->layer_mmaps[layer] : NULL,
+                                        K, ctx->layer_fds[layer]);
+                }
+                discard_deferred_experts();
+                pos++;
+            }
+        }
+
+        // Last prefill token
+        {
+            if (embed_batch) {
+                memcpy(ctx->hidden, embed_batch + (size_t)(pt->count - 1) * cfg.hidden_dim,
+                       cfg.hidden_dim * sizeof(float));
+            } else {
+                embed_lookup(ctx->wf, pt->ids[0], ctx->hidden);
+            }
+
+            for (int layer = 0; layer < cfg.num_layers; layer++) {
+                int is_full = cfg.is_full_attn[layer];
+                fused_layer_forward(ctx->wf, layer, ctx->hidden,
+                                    is_full ? ctx->kv_caches[layer] : NULL,
+                                    is_full ? NULL : ctx->layer_states[layer],
+                                    pos,
+                                    ctx->layer_mmaps[layer] != MAP_FAILED ? ctx->layer_mmaps[layer] : NULL,
+                                    K, ctx->layer_fds[layer]);
+            }
+            complete_deferred_experts();
+            pos++;
+        }
+
+        if (embed_batch) { free(embed_batch); embed_batch = NULL; }
+
+        // ---- Final norm + LM head + sample first token ----
+        if (ctx->final_norm_w) {
+            float *normed = malloc(cfg.hidden_dim * sizeof(float));
+            cpu_rms_norm(ctx->hidden, ctx->final_norm_w, normed, cfg.hidden_dim, cfg.rms_norm_eps);
+            memcpy(ctx->hidden, normed, cfg.hidden_dim * sizeof(float));
+            free(normed);
+        }
+
+        lm_head_forward(ctx->wf, ctx->hidden, ctx->logits);
+        int next_token = cpu_argmax(ctx->logits, cfg.vocab_size);
+
+        ctx->ttft_ms = now_ms() - t0;
+        ctx->tokens_generated = 1;
+
+        const char *token_text = decode_token(ctx->vocab, next_token);
+        if (callback) {
+            double gen_time = now_ms() - t0 - ctx->ttft_ms;
+            double tps = gen_time > 0 ? 1000.0 / gen_time : 0;
+            int stop = callback(token_text, next_token, ctx->tokens_generated, tps, user_data);
+            if (stop) {
+                free(pt->ids); free(pt);
+                ctx->current_pos = pos;
+                ctx->total_time_ms = now_ms() - t0;
+                return ctx->tokens_generated;
+            }
+        }
+
+        int in_think = (next_token == cfg.think_start_token) ? 1 : 0;
+        int think_tokens = 0;
+
+        // ---- Auto-regressive generation loop ----
+        double gen_start = now_ms();
+
+        for (int gen = 1; gen < max_tokens; gen++) {
+            if (atomic_load(&ctx->cancelled)) break;
+
+            int is_eos = 0;
+            for (int e = 0; e < cfg.num_eos_tokens; e++) {
+                if (next_token == cfg.eos_token_ids[e]) { is_eos = 1; break; }
+            }
+            if (is_eos) break;
+
+            if (next_token == cfg.think_start_token) in_think = 1;
+            if (next_token == cfg.think_end_token) in_think = 0;
+            if (in_think) think_tokens++;
+
+            embed_lookup(ctx->wf, next_token, ctx->hidden);
+
+            for (int layer = 0; layer < cfg.num_layers; layer++) {
+                int is_full = cfg.is_full_attn[layer];
+                fused_layer_forward(ctx->wf, layer, ctx->hidden,
+                                    is_full ? ctx->kv_caches[layer] : NULL,
+                                    is_full ? NULL : ctx->layer_states[layer],
+                                    pos,
+                                    ctx->layer_mmaps[layer] != MAP_FAILED ? ctx->layer_mmaps[layer] : NULL,
+                                    K, ctx->layer_fds[layer]);
+            }
+            complete_deferred_experts();
+            pos++;
+
+            if (ctx->final_norm_w) {
+                float *normed = malloc(cfg.hidden_dim * sizeof(float));
+                cpu_rms_norm(ctx->hidden, ctx->final_norm_w, normed, cfg.hidden_dim, cfg.rms_norm_eps);
+                memcpy(ctx->hidden, normed, cfg.hidden_dim * sizeof(float));
+                free(normed);
+            }
+
+            lm_head_forward(ctx->wf, ctx->hidden, ctx->logits);
+            next_token = cpu_argmax(ctx->logits, cfg.vocab_size);
+
+            if (in_think && g_think_budget > 0 && think_tokens >= g_think_budget) {
+                next_token = cfg.think_end_token;
+                in_think = 0;
+            }
+
+            ctx->tokens_generated++;
+            double elapsed_gen = now_ms() - gen_start;
+            ctx->tokens_per_second = elapsed_gen > 0 ? (ctx->tokens_generated - 1) * 1000.0 / elapsed_gen : 0;
+
+            token_text = decode_token(ctx->vocab, next_token);
+            if (callback) {
+                int stop = callback(token_text, next_token, ctx->tokens_generated,
+                                    ctx->tokens_per_second, user_data);
+                if (stop) break;
+            }
+        }
+
+        ctx->total_time_ms = now_ms() - t0;
+        double gen_elapsed = now_ms() - gen_start;
+        if (ctx->tokens_generated > 1 && gen_elapsed > 0) {
+            ctx->tokens_per_second = (ctx->tokens_generated - 1) * 1000.0 / gen_elapsed;
+        }
+
+        ctx->current_pos = pos;
+        ctx->turn_count++;
+
         free(pt->ids);
         free(pt);
 
@@ -568,6 +804,10 @@ void flashmoe_reset(FlashMoEContext *ctx) {
                 ctx->kv_caches[i]->len = 0;
             }
         }
+
+        // Reset conversation position
+        ctx->current_pos = 0;
+        ctx->turn_count = 0;
 
         // Reset stats
         ctx->tokens_generated = 0;
@@ -639,6 +879,11 @@ int flashmoe_validate_model(const char *model_path) {
     if (!has_4bit && !has_tiered && !has_2bit) return -1;
 
     return 0;
+}
+
+int flashmoe_turn_count(FlashMoEContext *ctx) {
+    if (!ctx) return 0;
+    return ctx->turn_count;
 }
 
 const char *flashmoe_last_error(FlashMoEContext *ctx) {

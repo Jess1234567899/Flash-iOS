@@ -146,10 +146,20 @@ struct ChatView: View {
         let assistantIndex = messages.count - 1
 
         Task {
-            // Build Qwen chat template prompt from conversation history
-            let formattedPrompt = buildChatPrompt(userMessage: text)
-            let stream = engine.generate(prompt: formattedPrompt, maxTokens: 500)
+            let stream: AsyncStream<GenerationToken>
+
+            if engine.canContinue {
+                // Reuse KV cache — only process the new user turn
+                stream = engine.generateContinuation(userMessage: text, maxTokens: 500)
+            } else {
+                // First message — full chat template with system prompt
+                let formattedPrompt = buildChatPrompt(userMessage: text)
+                stream = engine.generate(prompt: formattedPrompt, maxTokens: 500)
+            }
+
+            var gotTokens = false
             for await token in stream {
+                gotTokens = true
                 // Strip special tokens that leak through
                 let clean = token.text
                     .replacingOccurrences(of: "<|im_end|>", with: "")
@@ -159,6 +169,23 @@ struct ChatView: View {
                     messages[assistantIndex].text += clean
                 }
             }
+
+            // If continuation returned empty (context full), fall back to full generate
+            if !gotTokens && engine.canContinue {
+                engine.reset()
+                let formattedPrompt = buildChatPrompt(userMessage: text)
+                let fallbackStream = engine.generate(prompt: formattedPrompt, maxTokens: 500)
+                for await token in fallbackStream {
+                    let clean = token.text
+                        .replacingOccurrences(of: "<|im_end|>", with: "")
+                        .replacingOccurrences(of: "<|im_start|>", with: "")
+                        .replacingOccurrences(of: "<|endoftext|>", with: "")
+                    if !clean.isEmpty {
+                        messages[assistantIndex].text += clean
+                    }
+                }
+            }
+
             isGenerating = false
         }
     }
